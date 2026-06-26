@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+
+    <Version>1.0.0</Version>
+    <AssemblyTitle>Admin</AssemblyTitle>
+    <Authors>Impostor Community</Authors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Impostor.Api\Impostor.Api.csproj" />
+  </ItemGroup>
+
+</Project>
