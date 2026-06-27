@@ -22,12 +22,24 @@ namespace Impostor.Plugins.Admin.Http;
 [ApiController]
 public sealed class AdminController : ControllerBase
 {
+    private const string DefaultPassword = "CHANGE-ME";
+    private const string CookieName = "impostor_admin";
+    private const int MaxLoginAttempts = 5;
+    private static readonly TimeSpan BruteForceWindow = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan SessionExpiry = TimeSpan.FromHours(8);
+    private static readonly TimeSpan PasswordHashCacheDuration = TimeSpan.FromSeconds(10);
+
     private static readonly DateTime StartTime = DateTime.UtcNow;
 
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> Sessions = new();
+
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, (int Count, DateTime BlockedUntil)> FailedLogins = new();
+
     private static readonly object PasswordLock = new();
-    private static string? CachedPassword;
-    private static DateTime PasswordCacheTime = DateTime.MinValue;
-    private static readonly TimeSpan PasswordCacheDuration = TimeSpan.FromSeconds(30);
+    private static byte[]? CachedPasswordHash;
+    private static DateTime PasswordHashCacheTime = DateTime.MinValue;
+    private static bool? CachedIsDefaultPassword;
+    private static DateTime DefaultPasswordCheckTime = DateTime.MinValue;
 
     private readonly ILogger<AdminController> _logger;
     private readonly IGameManager _gameManager;
@@ -46,13 +58,13 @@ public sealed class AdminController : ControllerBase
         _bans = bans;
     }
 
-    private string GetPassword()
+    private byte[] GetPasswordHash()
     {
         lock (PasswordLock)
         {
-            if (CachedPassword != null && DateTime.UtcNow - PasswordCacheTime < PasswordCacheDuration)
+            if (CachedPasswordHash != null && DateTime.UtcNow - PasswordHashCacheTime < PasswordHashCacheDuration)
             {
-                return CachedPassword;
+                return CachedPasswordHash;
             }
         }
 
@@ -62,58 +74,221 @@ public sealed class AdminController : ControllerBase
         var path = Path.Combine(dir, "password.txt");
         if (!System.IO.File.Exists(path))
         {
-            System.IO.File.WriteAllText(path, "CHANGE-ME");
+            System.IO.File.WriteAllText(path, DefaultPassword);
+            _logger.LogWarning("[Admin] Created Admin/password.txt with default password. CHANGE IT IMMEDIATELY!");
         }
 
         var pw = System.IO.File.ReadAllText(path).Trim();
         if (string.IsNullOrEmpty(pw))
         {
-            pw = "CHANGE-ME";
+            pw = DefaultPassword;
         }
+
+        var hash = System.Security.Cryptography.SHA256.HashData(
+            System.Text.Encoding.UTF8.GetBytes(pw));
 
         lock (PasswordLock)
         {
-            CachedPassword = pw;
-            PasswordCacheTime = DateTime.UtcNow;
+            CachedPasswordHash = hash;
+            PasswordHashCacheTime = DateTime.UtcNow;
         }
 
-        return pw;
+        return hash;
+    }
+
+    public static bool IsDefaultPassword()
+    {
+        lock (PasswordLock)
+        {
+            if (CachedIsDefaultPassword.HasValue && DateTime.UtcNow - DefaultPasswordCheckTime < PasswordHashCacheDuration)
+            {
+                return CachedIsDefaultPassword.Value;
+            }
+        }
+
+        var dir = Path.Combine(Directory.GetCurrentDirectory(), "Admin");
+        var path = Path.Combine(dir, "password.txt");
+
+        string pw;
+        if (!System.IO.File.Exists(path))
+        {
+            pw = DefaultPassword;
+        }
+        else
+        {
+            pw = System.IO.File.ReadAllText(path).Trim();
+            if (string.IsNullOrEmpty(pw))
+            {
+                pw = DefaultPassword;
+            }
+        }
+
+        var isDefault = pw == DefaultPassword;
+
+        lock (PasswordLock)
+        {
+            CachedIsDefaultPassword = isDefault;
+            DefaultPasswordCheckTime = DateTime.UtcNow;
+        }
+
+        return isDefault;
+    }
+
+    private static bool VerifyPassword(string password, byte[] expectedHash)
+    {
+        var actualHash = System.Security.Cryptography.SHA256.HashData(
+            System.Text.Encoding.UTF8.GetBytes(password));
+        return System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(actualHash, expectedHash);
     }
 
     private bool IsAuthenticated()
-        => Request.Cookies.TryGetValue("impostor_admin", out var v) && v == GetPassword();
+    {
+        if (!Request.Cookies.TryGetValue(CookieName, out var token))
+        {
+            return false;
+        }
+
+        // Check if session token is valid and not expired.
+        if (Sessions.TryGetValue(token, out var expiry))
+        {
+            if (DateTime.UtcNow < expiry)
+            {
+                // Renew expiry on each request (sliding).
+                Sessions[token] = DateTime.UtcNow + SessionExpiry;
+                return true;
+            }
+
+            Sessions.TryRemove(token, out _);
+        }
+
+        return false;
+    }
+
+    private bool IsBruteForceBlocked(string ip)
+    {
+        if (FailedLogins.TryGetValue(ip, out var entry))
+        {
+            if (DateTime.UtcNow < entry.BlockedUntil)
+            {
+                return true;
+            }
+
+            if (entry.Count >= MaxLoginAttempts)
+            {
+                FailedLogins.TryRemove(ip, out _);
+            }
+        }
+
+        return false;
+    }
+
+    private bool RecordFailedLogin(string ip)
+    {
+        var now = DateTime.UtcNow;
+        FailedLogins.AddOrUpdate(
+            ip,
+            _ => (1, now + BruteForceWindow),
+            (_, existing) =>
+            {
+                // Reset if window expired.
+                if (now > existing.BlockedUntil && existing.Count < MaxLoginAttempts)
+                {
+                    return (1, now + BruteForceWindow);
+                }
+
+                var newCount = existing.Count + 1;
+                if (newCount >= MaxLoginAttempts)
+                {
+                    return (newCount, now + BruteForceWindow);
+                }
+
+                return (newCount, existing.BlockedUntil);
+            });
+
+        return IsBruteForceBlocked(ip);
+    }
 
 
     [HttpGet("/admin")]
     public IActionResult Panel()
-        => Content(IsAuthenticated() ? AdminHtml : LoginHtml, "text/html; charset=utf-8");
+    {
+        if (!IsAuthenticated())
+        {
+            return Content(LoginHtml, "text/html; charset=utf-8");
+        }
+
+        var html = AdminHtml;
+        if (IsDefaultPassword())
+        {
+            // Inject a red warning banner at the top of the page.
+            html = html.Replace("<!--WARN-->",
+                """
+                <div style="background:rgba(248,81,73,.15);border-bottom:2px solid var(--r);color:var(--r);text-align:center;padding:8px 16px;font-size:13px;font-weight:600">
+                    &#9888; You are using the default password! Change it in <code>Admin/password.txt</code> immediately.
+                </div>
+                """);
+        }
+
+        return Content(html, "text/html; charset=utf-8");
+    }
 
     [HttpPost("/admin/login")]
     public IActionResult Login([FromForm] string password)
     {
-        if (password != GetPassword())
+        var ip = HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+
+        if (IsBruteForceBlocked(ip))
         {
-            _logger.LogWarning("[Admin] Failed login from {Ip}", HttpContext.Connection.RemoteIpAddress);
+            _logger.LogWarning("[Admin] Blocked login attempt from {Ip} (brute-force protection)", ip);
             return Content(
                 LoginHtml.Replace("<!--ERR-->",
-                    "<p style='color:var(--r);margin-top:8px'>Incorrect password.</p>"),
+                    "<p style='color:var(--r);margin-top:8px'>Too many failed attempts. Try again in 5 minutes.</p>"),
                 "text/html; charset=utf-8");
         }
 
-        Response.Cookies.Append("impostor_admin", password, new CookieOptions
+        var expectedHash = GetPasswordHash();
+
+        if (!VerifyPassword(password, expectedHash))
+        {
+            var blocked = RecordFailedLogin(ip);
+            _logger.LogWarning("[Admin] Failed login from {Ip}", ip);
+
+            var msg = blocked
+                ? "Too many failed attempts. Try again in 5 minutes."
+                : "Incorrect password.";
+
+            return Content(
+                LoginHtml.Replace("<!--ERR-->",
+                    $"<p style='color:var(--r);margin-top:8px'>{msg}</p>"),
+                "text/html; charset=utf-8");
+        }
+
+        FailedLogins.TryRemove(ip, out _);
+
+        var token = Guid.NewGuid().ToString("N");
+        Sessions[token] = DateTime.UtcNow + SessionExpiry;
+
+        Response.Cookies.Append(CookieName, token, new CookieOptions
         {
             HttpOnly = true,
+            Secure = Request.IsHttps,
             SameSite = SameSiteMode.Strict,
-            MaxAge = TimeSpan.FromHours(8),
+            MaxAge = SessionExpiry,
         });
 
+        _logger.LogInformation("[Admin] Successful login from {Ip}", ip);
         return Redirect("/admin");
     }
 
     [HttpPost("/admin/logout")]
     public IActionResult Logout()
     {
-        Response.Cookies.Delete("impostor_admin");
+        if (Request.Cookies.TryGetValue(CookieName, out var token))
+        {
+            Sessions.TryRemove(token, out _);
+        }
+
+        Response.Cookies.Delete(CookieName);
         return Redirect("/admin");
     }
 
@@ -761,6 +936,7 @@ public sealed class AdminController : ControllerBase
     </style>
 </head>
 <body>
+    <!--WARN-->
     <header>
         <div class="dot" id="dot"></div>
         <h1><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--a)" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>Impostor Admin</h1><span class="sp"></span><span id="upd"></span>
