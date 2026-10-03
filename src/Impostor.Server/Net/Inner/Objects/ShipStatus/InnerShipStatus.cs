@@ -95,8 +95,7 @@ namespace Impostor.Server.Net.Inner.Objects.ShipStatus
                         return false;
                     }
 
-                    // TODO: properly deserialize this RPC
-                    // Rpc35UpdateSystem.Deserialize(reader, Game, out var systemType, out var playerControl, out var sequenceId, out var state, out var ventId);
+                    Rpc35UpdateSystem.Deserialize(reader, Game, out _, out _, out _, out _, out _);
                     break;
                 }
 
