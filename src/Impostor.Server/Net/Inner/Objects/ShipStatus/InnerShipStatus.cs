@@ -95,7 +95,31 @@ namespace Impostor.Server.Net.Inner.Objects.ShipStatus
                         return false;
                     }
 
-                    Rpc35UpdateSystem.Deserialize(reader, Game, out _, out _, out _, out _, out _);
+                    Rpc35UpdateSystem.Deserialize(reader, Game, out var systemType, out _, out _, out var state, out _);
+
+                    var isDoor = systemType == SystemTypes.Doors;
+                    var triggered = (state & 0x80) != 0 || systemType == SystemTypes.MushroomMixupSabotage;
+
+                    // Hide N Seek disables every sabotages.
+                    if (Game.Options.GameMode is GameModes.HideNSeek &&
+                        (triggered || isDoor) &&
+                        await sender.Client.ReportCheatAsync(call, CheatCategory.GameFlow, $"Client sabotaged {systemType} during Hide and Seek"))
+                    {
+                        return false;
+                    }
+
+                    if (!triggered || isDoor)
+                    {
+                        break;
+                    }
+
+                    if (_systems.TryGetValue(SystemTypes.Sabotage, out var system) &&
+                        system is SabotageSystemType sabotage &&
+                        sabotage.Timer > 0)
+                    {
+                        return false;
+                    }
+
                     break;
                 }
 
